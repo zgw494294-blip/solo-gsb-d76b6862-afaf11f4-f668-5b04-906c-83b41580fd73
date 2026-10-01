@@ -532,3 +532,121 @@ def test_diagnose_still_conjoins_full_evidence_near_limit(monkeypatch):
     r = client.post("/v1/diagnose", json=body)
     assert r.status_code == 422
     assert "非终端节点" in r.json()["detail"]
+
+
+# ---------- 多条读数组合否定顶事件（无单条与 top 直接矛盾）----------
+
+def _near_budget_top_or_tree():
+    """合法双 XOR 链汇合门 and13，顶事件 t=c OR z，and13 与 top 无关。
+
+    走真实建图路径（含 and13）累计约 473 个非终端节点；把额度调为 490
+    即复现“建图接近上限、无关复杂门 and13=false 的取反本会耗尽额度”的
+    现场（线上为接近 50000 的同构情形）。
+    """
+    evs = {f"e{i}": "1/2" for i in range(16)}
+    evs.update({"c": "1/2", "z": "1/2"})
+    g1, o1 = _xor_chain_gates("lx", "e0", [f"e{i}" for i in range(1, 13)])
+    g2, o2 = _xor_chain_gates("ly", "e13", ["e14", "e15"])
+    gates = g1 + g2 + [
+        ("and13", "AND", [o1, o2]),
+        ("t", "OR", ["c", "z"]),
+    ]
+    return evs, gates
+
+
+def _assert_structural_contradiction(body, monkeypatch, limit=490):
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "MAX_NONTERMINAL_NODES", limit)
+    r = client.post("/v1/likely-cause", json=body)
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "矛盾" in detail and "condition_probability=0" in detail
+    assert "非终端节点" not in detail
+
+
+def test_combined_readings_negating_top_detected_before_node_build(
+    monkeypatch,
+):
+    # t ≡ c OR z；c=false 与 z=false 两条读数合起来才使 top∧E 结构恒假，
+    # 没有任何一条读数单独等于 top=false。即便再加上无关的复杂门
+    # and13=false（其取反本会越过额度），也必须在构建任何取反/合取节点
+    # 之前仅基于已有 ROBDD 判定结构矛盾，返回结构矛盾 422 而非节点超限。
+    evs, gates = _near_budget_top_or_tree()
+    body = make_body(
+        evs, gates, "t", {"and13": False, "c": False, "z": False}
+    )
+    _assert_structural_contradiction(body, monkeypatch)
+
+
+def test_combined_contradiction_independent_of_reading_order(monkeypatch):
+    # 结论不受读数在 JSON 对象中的书写顺序影响。
+    evs, gates = _near_budget_top_or_tree()
+    for obs in (
+        {"z": False, "and13": False, "c": False},
+        {"c": False, "z": False, "and13": False},
+        {"and13": False, "z": False, "c": False},
+    ):
+        _assert_structural_contradiction(
+            make_body(evs, gates, "t", obs), monkeypatch
+        )
+
+
+def test_combined_contradiction_without_irrelevant_reading(monkeypatch):
+    # 删去无关的 and13 读数后，c=false、z=false 仍是同一结构矛盾。
+    evs, gates = _near_budget_top_or_tree()
+    _assert_structural_contradiction(
+        make_body(evs, gates, "t", {"c": False, "z": False}), monkeypatch
+    )
+
+
+def test_combined_contradiction_with_extra_irrelevant_reading(monkeypatch):
+    # 再多给一条与矛盾无关、且与 top 相容的读数（and13=true），错误原因
+    # 仍是结构矛盾：无关读数不影响判定。
+    evs, gates = _near_budget_top_or_tree()
+    _assert_structural_contradiction(
+        make_body(
+            evs, gates, "t",
+            {"c": False, "z": False, "and13": True, "e0": True},
+        ),
+        monkeypatch,
+    )
+
+
+def test_single_false_input_does_not_contradict_or_top(monkeypatch):
+    # 只读 c=false（z 仍可为真）时 top∧E 可满足，不应误报结构矛盾；在该
+    # 额度下 and13=false 的取反仍会真正超限，故返回节点超限 422。
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "MAX_NONTERMINAL_NODES", 490)
+    evs, gates = _near_budget_top_or_tree()
+    body = make_body(evs, gates, "t", {"and13": False, "c": False})
+    r = client.post("/v1/likely-cause", json=body)
+    assert r.status_code == 422
+    assert "非终端节点" in r.json()["detail"]
+
+
+def test_combined_contradiction_at_full_limit(monkeypatch):
+    # 不调小额度（保持 50000）：同样返回结构矛盾 422。
+    evs, gates = _near_budget_top_or_tree()
+    body = make_body(
+        evs, gates, "t", {"and13": False, "c": False, "z": False}
+    )
+    _assert_structural_contradiction(body, monkeypatch, limit=50_000)
+
+
+def test_renamed_gates_same_contradiction(monkeypatch):
+    # 结论与门/事件名称无关：把 and13、c、z、t 换成另一套名称，
+    # 结构同构时仍判定为组合矛盾。
+    evs = {f"e{i}": "1/2" for i in range(16)}
+    evs.update({"alpha": "1/2", "beta": "1/2"})
+    g1, o1 = _xor_chain_gates("px", "e0", [f"e{i}" for i in range(1, 13)])
+    g2, o2 = _xor_chain_gates("py", "e13", ["e14", "e15"])
+    gates = g1 + g2 + [
+        ("hub_gate", "AND", [o1, o2]),
+        ("root_cause", "OR", ["alpha", "beta"]),
+    ]
+    body = make_body(
+        evs, gates, "root_cause",
+        {"hub_gate": False, "alpha": False, "beta": False},
+    )
+    _assert_structural_contradiction(body, monkeypatch)
+

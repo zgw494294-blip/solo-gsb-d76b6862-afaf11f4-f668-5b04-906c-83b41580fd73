@@ -8,6 +8,10 @@
   2. 合并同构子图（相同三元组复用同一节点）。
 
 0/1 终端用整数 0 / 1 表示，非终端节点 id 从 2 开始。
+
+结构可满足性判定（literals_satisfiable）只读唯一表中已有的节点、沿
+low/high 边做多根余因子下降，不调用 mk/ITE，故绝不新增节点，也不枚举
+事件赋值；供观测类接口在为 false 读数取反或合取建图前识别结构矛盾。
 """
 
 from __future__ import annotations
@@ -106,18 +110,99 @@ class ROBDD:
         return self.ite(f, g, 0)
 
     def and_not(self, f: int, g: int) -> int:
-        """f ∧ ¬g，直接经 ITE(f, 1, 0) 与 ITE(g, 0, f) 求极性合取。
+        """f ∧ ¬g，直接经 ITE(g, 0, f) 求极性合取。
 
         与先 negate(g) 再 and_ 相比结果完全相同（同一唯一表规范化），
-        但无需先把 ¬g 的整棵子图建出来：当 f ∧ ¬g 结构上恒假（如
-        f 即 g）时，ITE 在终端情形直接归约为 0，不新增任何节点。
-        供 /v1/likely-cause 在合取 top∧¬读数 时尽早识别结构矛盾，
-        避免为无关的复杂取反读数耗尽节点额度。
+        但无需先把 ¬g 的整棵子图建出来。供 /v1/likely-cause 在结构可
+        满足性已确认后构建 top∧各读数（false 读数）时使用，避免为无关
+        读数预先构建整棵取反子图。
         """
         return self.ite(g, 0, f)
 
     def or_(self, f: int, g: int) -> int:
         return self.ite(f, 1, g)
+
+    # ---- 结构可满足性（只读已有节点，绝不新增节点，也不枚举事件赋值）----
+    def literals_satisfiable(self, literals: List[Tuple[int, bool]]) -> bool:
+        """判断已建 ROBDD 上若干“节点取指定真假值”的文字合取是否结构可满足。
+
+        literals 为 (node_id, polarity) 列表，polarity=False 表示要求该
+        节点取 0（读 false），但全程不为其取反构建任何新节点——各分支只
+        沿已有节点的 low/high 边下降，极性以逻辑标志携带。
+
+        做法是多根（合取）有序 BDD 的可满足 DFS：自顶向下按最小变量
+        等级取一个共同的余因子变量，所有该变量处分裂的节点同时走
+        low（=0）/high（=1），等级更高的节点在本层不分裂（两条余因子都
+        仍是其自身）。任一分支把全部文字带到终端 1 即存在一组事件赋值
+        使合取成立；两条都到终端 0 才是结构恒假。已约简 ROBDD 的任一非
+        终端节点本身可 0 可 1，递归深度至多 n_vars，状态用文字元组记忆
+        化避免共享子图上的指数重复——不枚举任何事件赋值。
+        """
+        # 归一化：去终端、去重复文字；出现“同一节点须同时取真取假”或
+        # “要求终端 0 取真 / 终端 1 取假”立即恒假
+        normalized: Dict[int, bool] = {}
+        for node, polarity in literals:
+            if node < 2:
+                if bool(node) != bool(polarity):
+                    return False
+                continue
+            prev = normalized.get(node)
+            if prev is not None and prev != polarity:
+                return False
+            normalized[node] = polarity
+        if not normalized:
+            return True
+
+        memo: Dict[Tuple[Tuple[int, bool], ...], bool] = {}
+
+        def state_key(pol: Dict[int, bool]) -> Tuple[Tuple[int, bool], ...]:
+            return tuple(sorted(pol.items()))
+
+        def dfs(pol: Dict[int, bool]) -> bool:
+            if not pol:
+                return True  # 全部文字已在某路径上被带到终端 1
+            key = state_key(pol)
+            cached = memo.get(key)
+            if cached is not None:
+                return cached
+
+            # 本层共同余因子变量：全部活跃节点变量等级的最小值
+            var = min(self.nodes[nid][0] for nid in pol)  # type: ignore[index]
+
+            result = False
+            for take_high in (False, True):
+                nxt: Dict[int, bool] = {}
+                feasible = True
+                for nid, polarity in pol.items():
+                    node = self.nodes[nid]
+                    assert node is not None
+                    nv, low, high = node
+                    if nv == var:
+                        child = high if take_high else low
+                        if child < 2:
+                            # 该文字在本分支被决定：终端取值须与要求一致
+                            if bool(child) != bool(polarity):
+                                feasible = False
+                                break
+                            continue  # 要求已满足，文字消失
+                        target = child
+                    else:
+                        # 变量等级更高，本分支不受影响，极性原样携带
+                        target = nid
+                    # 不同父节点可能坍缩到同一子节点：极性冲突即本分支恒假
+                    prev = nxt.get(target)
+                    if prev is not None and prev != polarity:
+                        feasible = False
+                        break
+                    nxt[target] = polarity
+                if feasible and dfs(nxt):
+                    result = True
+                    break
+
+            memo[key] = result
+            return result
+
+        return dfs(normalized)
 
     # ---- 精确概率与重要度 ----
     def node_probabilities(self, probs: List[Fraction]) -> List[Fraction]:
