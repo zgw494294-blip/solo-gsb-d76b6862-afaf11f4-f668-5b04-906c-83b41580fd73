@@ -119,6 +119,87 @@ class ROBDD:
     def or_(self, f: int, g: int) -> int:
         return self.ite(f, 1, g)
 
+    def jointly_satisfiable(self, literals: List[Tuple[int, bool]]) -> bool:
+        """已存在的多个节点（各自带真假极性）能否被同一完整赋值同时满足。
+
+        literals 每项为 (node, value)：要求 node 在所求赋值下取值等于
+        value（读 false 即要求 node=0，无需先构建 ¬node）。多个读数合
+        起来否定某函数时（如 t≡c∨z 而读数 c=0、z=0），单看任一读数都
+        不与 t 矛盾，只有合取后才恒假；直接 and_ 合取可能新增大量节点
+        甚至耗尽额度，本方法在**已有 ROBDD 上只读地**做可满足性判定：
+
+        不新增节点（余因子只沿既有 low/high 边跳转），也不枚举事件
+        赋值（记忆化的“合取路径”搜索）。变量按等级自前向后逐位决定，
+        同一前缀下各文字的余因子由其当前节点唯一确定，故状态可用
+        (节点 id, 极性) 元组记忆化；找到一条到达全部文字终端 1 的路径
+        即返回 True，两条分支均矛盾才为 False。结果只取决于文字集合，
+        与给出顺序、文字名称以及额外并入的无关文字无关（无关函数在每
+        步都随变量共余因子，不会消去可行路径）。
+        """
+        # 初始归一化：同节点要求矛盾（如 x=true 与 x=false）立即恒假
+        current: Dict[int, bool] = {}
+        for node, value in literals:
+            if node == 1:
+                if not value:
+                    return False  # 要求恒真节点取 0
+                continue
+            if node == 0:
+                if value:
+                    return False  # 要求恒假节点取 1
+                continue
+            if node in current and current[node] != value:
+                return False
+            current[node] = value
+        if not current:
+            return True
+
+        _MISS = object()
+        memo: Dict[Tuple[Tuple[int, bool], ...], object] = {}
+
+        def search(terms: Dict[int, bool]) -> bool:
+            # 当前全部活跃文字；终端文字已在归一化时剔除（遇终端 0 且
+            # 要求为真、或终端 1 且要求为假则立即矛盾）
+            assert terms
+            key = tuple(sorted(terms.items()))
+            cached = memo.get(key, _MISS)
+            if cached is not _MISS:
+                return bool(cached)
+
+            # 取本步待决定的最小等级变量
+            var = min(self.nodes[nid][0] for nid in terms)  # type: ignore[index]
+
+            feasible_branch = False
+            for branch in (0, 1):
+                nxt: Dict[int, bool] = {}
+                ok = True
+                for nid, value in terms.items():
+                    node = self.nodes[nid]
+                    assert node is not None
+                    nv, low, high = node
+                    cofactor = nid if nv > var else (high if branch else low)
+                    if cofactor == 1:
+                        if not value:
+                            ok = False  # 要求 ¬1
+                            break
+                        continue
+                    if cofactor == 0:
+                        if value:
+                            ok = False  # 要求 ¬0
+                            break
+                        continue
+                    # 同节点上不同极性要求 => 该分支矛盾；相同则合并
+                    if cofactor in nxt and nxt[cofactor] != value:
+                        ok = False
+                        break
+                    nxt[cofactor] = value
+                if ok and (not nxt or search(nxt)):
+                    feasible_branch = True
+                    break
+            memo[key] = feasible_branch
+            return feasible_branch
+
+        return search(current)
+
     # ---- 精确概率与重要度 ----
     def node_probabilities(self, probs: List[Fraction]) -> List[Fraction]:
         """自底向上求唯一表中每个节点的发生概率，按节点 id 索引返回。

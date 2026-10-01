@@ -502,6 +502,101 @@ def test_top_false_alone_is_structural_contradiction_near_limit(monkeypatch):
     assert "矛盾" in detail and "非终端节点" not in detail
 
 
+def test_combined_readings_negating_top_precede_node_limit(monkeypatch):
+    # 多条读数合起来才否定顶事件：top=and13 OR e15，and13=false 与
+    # e15=false 联立即 top=false（单看任一读数都不与 top 矛盾），
+    # 另加的 e13=false 是强制文字。复杂读数 and13=false 的取反本会越过
+    # 额度，但结构矛盾必须在构建任何取反/合取节点前判定，返回 422
+    # 结构矛盾而非节点超限。
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "MAX_NONTERMINAL_NODES", 490)
+    evs, gates = _near_budget_tree()
+    body = make_body(
+        evs, gates, "top",
+        {"and13": False, "e13": False, "e15": False},
+    )
+    r = client.post("/v1/likely-cause", json=body)
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "矛盾" in detail and "condition_probability=0" in detail
+    assert "非终端节点" not in detail
+
+
+def test_combined_contradiction_independent_of_reading_order(monkeypatch):
+    # 结论不受读数给出顺序影响：JSON 对象顺序倒置后仍是同一结构矛盾
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "MAX_NONTERMINAL_NODES", 490)
+    evs, gates = _near_budget_tree()
+    for obs in (
+        {"e15": False, "e13": False, "and13": False},
+        {"e13": False, "e15": False, "and13": False},
+        {"and13": False, "e15": False},
+    ):
+        body = make_body(evs, gates, "top", obs)
+        r = client.post("/v1/likely-cause", json=body)
+        assert r.status_code == 422, (obs, r.text)
+        detail = r.json()["detail"]
+        assert "矛盾" in detail and "非终端节点" not in detail, obs
+
+
+def test_combined_contradiction_unaffected_by_irrelevant_reading(monkeypatch):
+    # 追加与矛盾无关的读数（可满足的任意门读数）不改变错误原因
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "MAX_NONTERMINAL_NODES", 490)
+    evs, gates = _near_budget_tree()
+    for obs in (
+        {"and13": False, "e15": False, "e14": True},
+        {"and13": False, "e15": False, "e14": False},
+        {"and13": False, "e15": False, "e0": True, "e1": False},
+    ):
+        body = make_body(evs, gates, "top", obs)
+        r = client.post("/v1/likely-cause", json=body)
+        assert r.status_code == 422, (obs, r.text)
+        assert "矛盾" in r.json()["detail"] and "非终端节点" not in r.json()["detail"]
+
+
+def test_t_equiv_c_or_z_with_both_false_is_contradiction():
+    # 任务现场的小型同构：t = c OR z，读数 {c:false, z:false} 联立否定 t
+    evs = {"c": "1/2", "z": "1/2"}
+    gates = [("t", "OR", ["c", "z"])]
+    # 两条都给
+    r = client.post(
+        "/v1/likely-cause", json=make_body(evs, gates, "t", {"c": False, "z": False})
+    )
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert "矛盾" in detail and "condition_probability=0" in detail
+    # 删掉任一条读数则可满足，正常返回成因
+    for obs in ({"c": False}, {"z": False}):
+        data = check_against_brute(evs, gates, "t", obs)
+        assert data is not None
+
+
+def test_satisfiable_near_limit_still_returns_normal_result(monkeypatch):
+    # 结构可满足时限额与正常成因字段不变：and13=true 蕴含 top。
+    # 注意该电路穷举求值随门深度指数增长，故此处直接断言精确结果而不
+    # 走 check_against_brute（其递归求值器无记忆化）：
+    # 两条 13 位/3 位 XOR 链各 1/2 奇校验 => P(and13)=1/4 => P(C)=1/4；
+    # 全部 p=1/2 时 16384 组满足赋值等权 1/65536，按 id 字典序 false
+    # 优先取真假序列最小者。注意事件按 id 字典序排列（e0,e1,e10,…），
+    # 字典序最小的奇校验组合只置 e9 与 e15 为 true。
+    import app.main as main_mod
+    monkeypatch.setattr(main_mod, "MAX_NONTERMINAL_NODES", 490)
+    evs, gates = _near_budget_tree()
+    body = make_body(evs, gates, "top", {"and13": True})
+    r = client.post("/v1/likely-cause", json=body)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert list(data["assignment"]) == sorted(evs)
+    assert data["condition_probability"] == "1/4"
+    assert data["assignment_posterior"] == "1/16384"
+    assert data["assignment"] == {
+        **{f"e{i}": False for i in range(16)},
+        "e9": True,
+        "e15": True,
+    }
+
+
 def test_genuine_computation_near_limit_still_reports_node_limit(monkeypatch):
     # 不与 top 矛盾、确需计算的复杂 false 读数（and13=false）超限时，
     # 仍返回节点超限 422，不被结构矛盾短路吞掉。

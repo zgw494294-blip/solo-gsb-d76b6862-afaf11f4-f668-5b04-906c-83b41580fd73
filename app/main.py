@@ -48,8 +48,14 @@ POST /v1/likely-cause
   字典序比较真假序列、false 优先。返回按 id 排列的 assignment、
   condition_probability=P(C) 与 assignment_posterior=P(A)/P(C)，
   分数均约分。共享引用、NOT 门与未被结构约束的事件都参与赋值及
-  概率计算；复用 ROBDD 精确求最优赋值，不枚举事件状态；P(C)=0
-  或累计非终端节点超过 50000 时返回 422。
+  概率计算。建图成功后先在已有 ROBDD 上只读地判定顶事件与全部
+  带真假读数能否同时成立（记忆化合取路径搜索，不新增节点、不枚举
+  事件赋值，与读数顺序、名称及无关读数无关）：结构不成立（含多条
+  读数合起来才否定顶事件的情形，如 t≡c∨z 而 c=false、z=false）
+  返回说明结构矛盾、condition_probability=0 的 422；结构可满足后
+  复用 ROBDD 精确求最优赋值，不枚举事件状态，保留 50000 非终端
+  节点限额——真正超限仍返回 422；仅因 0/1 先验导致 P(C)=0 与
+  结构矛盾按原规则区分。
 
 POST /v1/compare-trees
   输入：共用一份 events（1~32 个独立事件，概率为 n/d 分数字符串），
@@ -744,11 +750,14 @@ def build_tree_robdd(
 # 共用同一段准备过程：静态校验 → 观测键校验 → 在同一 ROBDD 中求值事件、
 # 门与未被 top 引用的观测/候选门 → 记录各读数的原始（未取反）节点。
 # “读 false 取节点取反”这一步按各接口需要分别进行：诊断与巡检仍按
-# 完整 E 预先取反全部读数（保持原节点额度语义）；最可能原因按
-# top∧E 用极性合取（bdd.and_not）随合取随判定，顶事件读数（top=false）
-# 最先处理——一旦 top 与已处理读数合取恒假即返回结构矛盾 422，
-# 无关读数的取反节点不再被预先构建、也不会改变错误原因；
-# 冲突定位仍按读数子集枚举最小零概率组。
+# 完整 E 预先取反全部读数（保持原节点额度语义）；最可能原因在建图
+# 成功后、构建任何取反/合取节点之前，先在已有 ROBDD 上只读地判定
+# 顶事件与全部读数（各自带真假极性）能否同时成立
+# （bdd.jointly_satisfiable：合取路径记忆化搜索，不新增节点、不枚举
+# 事件赋值），多条读数合起来才否定顶事件（如 t≡c∨z 而 c=false、
+# z=false）时同样识别为结构矛盾——结论与读数顺序、名称及无关读数
+# 无关；判定可满足后才按原流程用极性合取（bdd.and_not）构建 C，
+# 真正超限仍返回节点超限；冲突定位仍按读数子集枚举最小零概率组。
 
 
 class ObservationContext(NamedTuple):
@@ -811,8 +820,8 @@ def _build_observation_context(
     /v1/inspect-next、/v1/observation-conflicts）按字典序为每个读数
     取“读 1 用节点本身、读 0 用 BDD 取反”，与历史行为逐节点一致；
     eager_constraints=False 时（/v1/likely-cause）不预先取反，由调用
-    方用极性合取（bdd.and_not）随 top∧E 的构建随处理随判定，使结构
-    矛盾能在耗尽额度前短路返回。
+    方在结构可满足性预判定（bdd.jointly_satisfiable，只读、不新增
+    节点）通过后，用极性合取（bdd.and_not）构建 top∧E。
     """
     extra_gates = tuple(
         k for k in list(observations) + list(extra_ids) if k in gate_ops
@@ -870,9 +879,10 @@ def _conjoin_reading(
     """把单个读数合取进 current：读 true 为 current∧node，读 false 为
     current∧¬node。
 
-    读 false 时直接用极性合取 and_not，不预先构建 ¬node 的整棵子图：
-    current 与 node 已使合取结构恒假（如 current 即 node）时 ITE 在
-    终端归约为 0，不新增节点——结构矛盾因此能在节点额度耗尽前识别。
+    读 false 时直接用极性合取 and_not，不预先构建 ¬node 的整棵子图。
+    /v1/likely-cause 调用前已由 bdd.jointly_satisfiable 保证顶事件与
+    全部读数结构上可同时满足，故此处只会遇到真正需要的计算（可能
+    因节点额度耗尽而超限），不会把结构矛盾误报成节点超限。
     """
     if value:
         return bdd.and_(current, node)
@@ -1186,21 +1196,32 @@ def inspect_next_logic(payload: InspectNextRequest) -> InspectNextResponse:
 
 def likely_cause_logic(payload: LikelyCauseRequest) -> LikelyCauseResponse:
     # 最可能原因按 top∧E 计算：顶事件发生且全部读数成立（同一 ROBDD 上
-    # 的合取）。不预先为全部 false 读数取反——顶事件读数最先合取：
-    # 观测到 top=false 时 top∧¬top 经极性合取直接归约为终端 0（不新增
-    # 节点），即使合法建图已逼近 50000 节点上限，结构矛盾也能在额度
-    # 耗尽前识别；其余读数随后按字典序逐个合取并随即可短路，无关读数
-    # 的取反节点不会再被构建，也就不会把结构矛盾误报成节点超限。
+    # 的合取）。建图成功后先做一次只读的结构可满足性判定：顶事件与
+    # 全部读数（读 false 也只带极性，不构建 ¬节点）能否被同一事件赋值
+    # 同时满足。该判定在已有 ROBDD 上做记忆化合取路径搜索，不新增
+    # 节点、不枚举事件赋值，结果只取决于文字集合——多条读数合起来才
+    # 否定顶事件（如 t≡c∨z 而 c=false、z=false，单看任一读数都不与
+    # top 矛盾）时同样识别，且不受读数顺序、名称或无关读数影响。
+    # 即使合法建图已逼近 50000 节点上限（复杂 false 读数的取反本会
+    # 耗尽额度），结构矛盾也不会被误报成节点超限。
     ctx = _prepare_observation_context(payload, eager_constraints=False)
     bdd = ctx.bdd
 
+    reading_literals = [(ctx.top_node, True)] + [
+        (ctx.node_map[oid], ctx.obs_values[oid]) for oid in ctx.obs_ids
+    ]
+    if not bdd.jointly_satisfiable(reading_literals):
+        raise ValueError(
+            "顶事件与观测相互矛盾：顶事件发生且全部读数同时成立在"
+            "结构上不可能（结构约束的合取恒为假），"
+            "condition_probability=0"
+        )
+
+    # 结构可满足：按原流程构建 C（读 false 用极性合取 and_not，不预先
+    # 构建整棵取反子图），保留 50000 非终端节点限额——真正需要计算而
+    # 超限时仍返回节点超限 422。
     condition = ctx.top_node
-    reading_ids = list(ctx.obs_ids)
-    if payload.top in ctx.obs_values:
-        reading_ids = [payload.top] + [
-            oid for oid in reading_ids if oid != payload.top
-        ]
-    for oid in reading_ids:
+    for oid in ctx.obs_ids:
         condition = _conjoin_reading(
             bdd, condition, ctx.node_map[oid], ctx.obs_values[oid]
         )
@@ -1211,6 +1232,8 @@ def likely_cause_logic(payload: LikelyCauseRequest) -> LikelyCauseResponse:
     condition_prob = node_prob[condition]
 
     if condition_prob == 0:
+        # 预判定已保证结构可满足，condition 不会是终端 0；此分支仅由
+        # 0/1 先验造成（保留原区分与说明，防御性保留 condition==0）
         if condition == 0:
             raise ValueError(
                 "顶事件与观测相互矛盾：顶事件发生且全部读数同时成立在"

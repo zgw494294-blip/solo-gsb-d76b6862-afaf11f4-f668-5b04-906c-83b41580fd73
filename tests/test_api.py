@@ -432,3 +432,67 @@ def test_and_not_structural_zero_adds_no_nodes_near_limit():
     bdd.limit = before
     assert bdd.and_not(f, f) == 0
     assert len(bdd.nodes) - 2 == before
+
+
+def test_jointly_satisfiable_basic_polarities():
+    bdd = ROBDD(3)
+    a, b, c = (bdd.mk(i, 0, 1) for i in range(3))
+    t = bdd.or_(bdd.and_(a, b), c)
+    # t = (a∧b)∨c
+    assert bdd.jointly_satisfiable([(t, True)])
+    assert bdd.jointly_satisfiable([(t, False)])
+    # t=false 且 c=false 且 a=true：仍可由 b=false 满足
+    assert bdd.jointly_satisfiable([(t, False), (c, False), (a, True)])
+    # t=false 且 c=false 且 a=true 且 b=true：恒假（多条读数合起来否定 t）
+    assert not bdd.jointly_satisfiable(
+        [(t, False), (c, False), (a, True), (b, True)]
+    )
+    # 同一节点相反极性立即矛盾
+    assert not bdd.jointly_satisfiable([(a, True), (a, False)])
+    # 终端文字
+    assert not bdd.jointly_satisfiable([(0, True)])
+    assert not bdd.jointly_satisfiable([(1, False)])
+    assert bdd.jointly_satisfiable([(1, True), (0, False), (a, True)])
+
+
+def test_jointly_satisfiable_order_and_repetition_independent():
+    import random
+
+    rng = random.Random(7)
+    bdd = ROBDD(5)
+    xs = [bdd.mk(i, 0, 1) for i in range(5)]
+    f = xs[0]
+    for x in xs[1:]:  # 奇偶链
+        f = bdd.or_(bdd.and_(f, bdd.negate(x)),
+                    bdd.and_(bdd.negate(f), x))
+    g = bdd.and_(xs[1], xs[2])
+    h = bdd.or_(f, bdd.negate(g))
+    lits = [(f, False), (g, True), (h, False), (xs[0], True), (xs[2], True)]
+    expected = bdd.jointly_satisfiable(lits)
+    for _ in range(10):
+        sh = lits[:]
+        rng.shuffle(sh)
+        assert bdd.jointly_satisfiable(sh) == expected
+        assert bdd.jointly_satisfiable(sh + [lits[0]]) == expected
+
+
+def test_jointly_satisfiable_adds_no_nodes_under_exhausted_budget():
+    # 额度耗尽（任何 mk 都会抛错）时，联合可满足性判定仍须只读完成，
+    # 不新增任何节点；结构矛盾与可满足两种情形都要给出正确结论
+    bdd = ROBDD(6, limit=50_000)
+    xs = [bdd.mk(i, 0, 1) for i in range(6)]
+    f = xs[0]
+    for x in xs[1:]:
+        f = bdd.or_(bdd.and_(f, bdd.negate(x)),
+                    bdd.and_(bdd.negate(f), x))
+    g = bdd.and_(xs[4], xs[5])
+    before = len(bdd.nodes)
+    bdd.limit = before - 2  # 禁止再创建任何节点
+    assert not bdd.jointly_satisfiable(
+        [(g, True), (xs[4], False)]
+    )  # g=true 与 e4=false（再加 e5 任意）合起来恒假
+    assert bdd.jointly_satisfiable(
+        [(g, True), (xs[4], True), (xs[5], True), (f, False)]
+    )
+    assert not bdd.jointly_satisfiable([(f, True), (f, False)])
+    assert len(bdd.nodes) == before
